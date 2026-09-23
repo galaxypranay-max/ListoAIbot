@@ -19,7 +19,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.error import TelegramError
+from telegram.error import TelegramError, Conflict, NetworkError
 
 from prompt import SYSTEM_PROMPT, format_listing
 
@@ -41,7 +41,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_MODEL   = os.getenv(
     "OPENROUTER_MODEL",
-    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",   # change via Railway env var
+    "meta-llama/llama-3.2-11b-vision-instruct:free",   # change via Railway env var
 ).strip()
 
 if not TELEGRAM_BOT_TOKEN:
@@ -160,7 +160,7 @@ async def _call_openrouter(images: list[tuple[str, str]]) -> str:
                     f"(finish_reason={finish_reason}). "
                     f"Yeh model vision/image support nahi karta. "
                     f"Railway Variables mein OPENROUTER_MODEL change karo — "
-                    f"recommended: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+                    f"recommended: meta-llama/llama-3.2-11b-vision-instruct:free"
                 )
 
             raw = content_value.strip()
@@ -399,6 +399,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Global error handler.
+    - Conflict (409): Railway redeploy ke waqt 2 instances overlap karte hain — just log it.
+    - NetworkError: Temporary Telegram outage — just log it.
+    - Everything else: log with full details.
+    """
+    err = context.error
+
+    if isinstance(err, Conflict):
+        # Happens briefly during Railway redeploys — safe to ignore
+        logger.warning("409 Conflict: old instance still shutting down. Will resolve in seconds.")
+        return
+
+    if isinstance(err, NetworkError):
+        logger.warning(f"NetworkError (temporary): {err}")
+        return
+
+    logger.error(f"Unhandled error: {err}", exc_info=err)
+
+
 # ─────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────
@@ -417,6 +438,9 @@ def main() -> None:
     # Messages
     app.add_handler(MessageHandler(filters.PHOTO,                    handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,  handle_text))
+
+    # Global error handler — handles 409 Conflict on Railway redeploys
+    app.add_error_handler(handle_error)
 
     # Start polling (Railway supports long-running workers)
     app.run_polling(drop_pending_updates=True)
