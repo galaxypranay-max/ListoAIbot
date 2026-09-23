@@ -149,7 +149,21 @@ async def _call_openrouter(images: list[tuple[str, str]]) -> str:
                 resp = await client.post(url, json=payload, headers=headers)
                 resp.raise_for_status()
 
-            raw = resp.json()["choices"][0]["message"]["content"].strip()
+            response_data = resp.json()
+            content_value = response_data["choices"][0]["message"]["content"]
+
+            # Some models return None when they don't support vision/images
+            if content_value is None:
+                finish_reason = response_data["choices"][0].get("finish_reason", "unknown")
+                raise ValueError(
+                    f"Model '{OPENROUTER_MODEL}' returned empty response "
+                    f"(finish_reason={finish_reason}). "
+                    f"Yeh model vision/image support nahi karta. "
+                    f"Railway Variables mein OPENROUTER_MODEL change karo — "
+                    f"recommended: meta-llama/llama-3.2-11b-vision-instruct:free"
+                )
+
+            raw = content_value.strip()
             logger.info(
                 f"OpenRouter OK | model={OPENROUTER_MODEL} "
                 f"| images={len(images)} | chars={len(raw)} | attempt={attempt}"
