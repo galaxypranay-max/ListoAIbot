@@ -41,7 +41,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_MODEL   = os.getenv(
     "OPENROUTER_MODEL",
-    "meta-llama/llama-3.2-11b-vision-instruct:free",   # change via Railway env var
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",   # change via Railway env var
 ).strip()
 
 if not TELEGRAM_BOT_TOKEN:
@@ -160,7 +160,7 @@ async def _call_openrouter(images: list[tuple[str, str]]) -> str:
                     f"(finish_reason={finish_reason}). "
                     f"Yeh model vision/image support nahi karta. "
                     f"Railway Variables mein OPENROUTER_MODEL change karo — "
-                    f"recommended: meta-llama/llama-3.2-11b-vision-instruct:free"
+                    f"recommended: nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
                 )
 
             raw = content_value.strip()
