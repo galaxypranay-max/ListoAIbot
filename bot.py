@@ -43,6 +43,10 @@ OPENROUTER_MODEL   = os.getenv(
     "OPENROUTER_MODEL",
     "meta-llama/llama-3.2-11b-vision-instruct:free",   # change via Railway env var
 ).strip()
+API_BASE_URL       = os.getenv(
+    "API_BASE_URL",
+    "https://openrouter.ai/api/v1",                    # change via Railway env var
+).strip().rstrip("/")
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("Missing env var: TELEGRAM_BOT_TOKEN")
@@ -117,7 +121,7 @@ async def _call_openrouter(images: list[tuple[str, str]]) -> str:
     Returns: formatted listing string
     Retries up to 3 times with exponential backoff.
     """
-    url = "https://openrouter.ai/api/v1/chat/completions"
+    url = f"{API_BASE_URL}/chat/completions"
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -346,8 +350,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"🤖 Current model:\n{OPENROUTER_MODEL}\n\n"
-        "Model change karne ke liye Railway → Variables mein\n"
-        "OPENROUTER_MODEL update karo."
+        f"🌐 API Base URL:\n{API_BASE_URL}\n\n"
+        "Change karne ke liye Railway → Variables:\n"
+        "• OPENROUTER_MODEL\n"
+        "• API_BASE_URL"
     )
 
 
@@ -427,6 +433,7 @@ async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> No
 def main() -> None:
     logger.info("Starting BGMI Describe Bot (@ListoAIbot)")
     logger.info(f"Model: {OPENROUTER_MODEL}")
+    logger.info(f"API Base URL: {API_BASE_URL}")
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
