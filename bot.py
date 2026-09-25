@@ -1,6 +1,7 @@
 """
 BGMI Describe Bot — @ListoAIbot
 Analyzes BGMI screenshots and generates structured listings.
+3 buttons: GUNS | VEHICLE | FULL INVENTORY
 Deploy on Railway · Uses OpenRouter vision API
 """
 
@@ -11,17 +12,24 @@ import base64
 import asyncio
 
 import httpx
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
 from telegram.error import TelegramError, Conflict, NetworkError
 
-from prompt import SYSTEM_PROMPT, format_listing
+from prompt import (
+    SYSTEM_PROMPT,
+    parse_ai_response,
+    format_guns,
+    format_vehicles,
+    format_full_inventory,
+)
 
 # ─────────────────────────────────────────────────────────────
 # Logging
@@ -34,18 +42,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────
-# Environment Variables  (set these in Railway)
+# Environment Variables  (set in Railway → Variables)
 # ─────────────────────────────────────────────────────────────
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_MODEL   = os.getenv(
     "OPENROUTER_MODEL",
-    "meta-llama/llama-3.2-11b-vision-instruct:free",   # change via Railway env var
+    "meta-llama/llama-3.2-11b-vision-instruct:free",
 ).strip()
 API_BASE_URL       = os.getenv(
     "API_BASE_URL",
-    "https://openrouter.ai/api/v1",                    # change via Railway env var
+    "https://openrouter.ai/api/v1",
 ).strip().rstrip("/")
 
 if not TELEGRAM_BOT_TOKEN:
@@ -54,45 +62,39 @@ if not OPENROUTER_API_KEY:
     raise RuntimeError("Missing env var: OPENROUTER_API_KEY")
 
 # ─────────────────────────────────────────────────────────────
-# Media-group batching state
+# In-memory state
 # ─────────────────────────────────────────────────────────────
 
-# { media_group_id: [file_id, ...] }
-_pending_groups: dict[str, list[str]] = {}
+# Media group batching
+_pending_groups:   dict[str, list[str]] = {}   # group_id → [file_id, ...]
+_scheduled_groups: set[str]             = set() # group_ids with a scheduled task
 
-# media_group_ids that already have a scheduled asyncio task
-_scheduled_groups: set[str] = set()
+# Parsed account data cache — keyed by chat_id
+# Stores the latest parsed JSON dict per user so buttons can retrieve it
+_user_cache: dict[int, dict] = {}
 
 # ─────────────────────────────────────────────────────────────
 # Image helpers
 # ─────────────────────────────────────────────────────────────
 
 def _detect_mime(data: bytes) -> str:
-    """Detect image MIME type from magic bytes — no external library needed."""
     if data[:8] == b"\x89PNG\r\n\x1a\n":
         return "image/png"
     if data[:3] == b"\xff\xd8\xff":
         return "image/jpeg"
     if len(data) > 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "image/webp"
-    return "image/jpeg"  # safe fallback
+    return "image/jpeg"
 
 
 def _prepare_image(raw: bytes) -> tuple[str, str]:
-    """
-    Compress & resize image, return (base64_string, mime_type).
-    Falls back to raw bytes if Pillow is unavailable.
-    """
+    """Compress + resize image → (base64_string, mime_type)."""
     try:
         from PIL import Image
 
         img = Image.open(io.BytesIO(raw))
-
-        # JPEG doesn't support alpha — convert to RGB
         if img.mode in ("RGBA", "P", "LA", "L"):
             img = img.convert("RGB")
-
-        # Resize: keep longest side ≤ 1280 px  (saves API time & cost)
         if max(img.size) > 1280:
             img.thumbnail((1280, 1280), Image.LANCZOS)
 
@@ -102,9 +104,9 @@ def _prepare_image(raw: bytes) -> tuple[str, str]:
         return base64.standard_b64encode(compressed).decode(), "image/jpeg"
 
     except ImportError:
-        logger.warning("Pillow not installed — sending original image bytes")
+        logger.warning("Pillow not installed — sending original bytes")
     except Exception as e:
-        logger.warning(f"Image compression failed: {e} — sending original")
+        logger.warning(f"Image compression failed: {e}")
 
     mime = _detect_mime(raw)
     return base64.standard_b64encode(raw).decode(), mime
@@ -117,30 +119,27 @@ def _prepare_image(raw: bytes) -> tuple[str, str]:
 async def _call_openrouter(images: list[tuple[str, str]]) -> str:
     """
     Send images to OpenRouter vision model.
-    images : list of (base64_data, mime_type)
-    Returns: formatted listing string
+    Returns raw string response from AI.
     Retries up to 3 times with exponential backoff.
     """
-    url = f"{API_BASE_URL}/chat/completions"
-
+    url     = f"{API_BASE_URL}/chat/completions"
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/listo-ai-bot",
-        "X-Title": "BGMI Describe Bot",
+        "Content-Type":  "application/json",
+        "HTTP-Referer":  "https://github.com/listo-ai-bot",
+        "X-Title":       "BGMI Describe Bot",
     }
 
-    # Build vision message: prompt text + one image block per screenshot
     content: list[dict] = [{"type": "text", "text": SYSTEM_PROMPT}]
     for b64, mime in images:
         content.append({
-            "type": "image_url",
+            "type":      "image_url",
             "image_url": {"url": f"data:{mime};base64,{b64}"},
         })
 
     payload = {
-        "model": OPENROUTER_MODEL,
-        "messages": [{"role": "user", "content": content}],
+        "model":      OPENROUTER_MODEL,
+        "messages":   [{"role": "user", "content": content}],
         "max_tokens": 2048,
         "temperature": 0.1,
     }
@@ -153,18 +152,15 @@ async def _call_openrouter(images: list[tuple[str, str]]) -> str:
                 resp = await client.post(url, json=payload, headers=headers)
                 resp.raise_for_status()
 
-            response_data = resp.json()
-            content_value = response_data["choices"][0]["message"]["content"]
+            resp_data     = resp.json()
+            content_value = resp_data["choices"][0]["message"]["content"]
 
-            # Some models return None when they don't support vision/images
             if content_value is None:
-                finish_reason = response_data["choices"][0].get("finish_reason", "unknown")
+                finish = resp_data["choices"][0].get("finish_reason", "unknown")
                 raise ValueError(
                     f"Model '{OPENROUTER_MODEL}' returned empty response "
-                    f"(finish_reason={finish_reason}). "
-                    f"Yeh model vision/image support nahi karta. "
-                    f"Railway Variables mein OPENROUTER_MODEL change karo — "
-                    f"recommended: meta-llama/llama-3.2-11b-vision-instruct:free"
+                    f"(finish_reason={finish}). "
+                    "Vision support nahi hai ya rate limit. Model change karo."
                 )
 
             raw = content_value.strip()
@@ -172,16 +168,16 @@ async def _call_openrouter(images: list[tuple[str, str]]) -> str:
                 f"OpenRouter OK | model={OPENROUTER_MODEL} "
                 f"| images={len(images)} | chars={len(raw)} | attempt={attempt}"
             )
-            return format_listing(raw)
+            return raw
 
         except httpx.HTTPStatusError as e:
             last_exc = e
-            code = e.response.status_code
+            code     = e.response.status_code
             logger.error(f"OpenRouter HTTP {code} (attempt {attempt}): {e.response.text[:300]}")
             if code in (429, 500, 502, 503, 504) and attempt < 3:
-                await asyncio.sleep(2 ** attempt)   # 2 s → 4 s
+                await asyncio.sleep(2 ** attempt)
                 continue
-            raise   # non-retryable (4xx etc.)
+            raise
 
         except (httpx.TimeoutException, httpx.ConnectError) as e:
             last_exc = e
@@ -195,15 +191,28 @@ async def _call_openrouter(images: list[tuple[str, str]]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
+# Button builder
+# ─────────────────────────────────────────────────────────────
+
+def _build_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    """3-button inline keyboard for choosing which section to show."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔫 GUNS",          callback_data=f"guns:{chat_id}"),
+        InlineKeyboardButton("🚘 VEHICLE",       callback_data=f"vehicle:{chat_id}"),
+        InlineKeyboardButton("📦 FULL INVENTORY", callback_data=f"full:{chat_id}"),
+    ]])
+
+
+# ─────────────────────────────────────────────────────────────
 # Photo processing
 # ─────────────────────────────────────────────────────────────
 
 async def _process_photos(
     file_ids: list[str],
-    chat_id: int,
-    context: ContextTypes.DEFAULT_TYPE,
+    chat_id:  int,
+    context:  ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Download → compress → analyze → send listing."""
+    """Download → compress → analyze → cache JSON → send 3 buttons."""
 
     # ── Download all images ──────────────────────────────────
     images: list[tuple[str, str]] = []
@@ -219,38 +228,116 @@ async def _process_photos(
     if not images:
         await context.bot.send_message(
             chat_id=chat_id,
-            text="❌ Screenshots download hone mein error aaya.\nPlease dobara try karo.",
+            text="❌ Screenshots download nahi hue. Dobara try karo.",
         )
         return
 
     # ── Call OpenRouter ──────────────────────────────────────
     try:
-        listing = await _call_openrouter(images)
+        raw = await _call_openrouter(images)
     except httpx.HTTPStatusError as e:
-        logger.error(f"API error: {e}")
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="❌ AI API error. Thodi der baad try karo.",
-        )
+        logger.error(f"API HTTP error: {e}")
+        await context.bot.send_message(chat_id=chat_id, text="❌ AI API error. Thodi der baad try karo.")
         return
     except Exception as e:
         logger.error(f"Analysis failed: {e}")
-        await context.bot.send_message(
+        await context.bot.send_message(chat_id=chat_id, text="❌ Screenshot analyze nahi hua. Dobara try karo.")
+        return
+
+    # ── Parse JSON & cache ───────────────────────────────────
+    data = parse_ai_response(raw)
+    _user_cache[chat_id] = data
+    logger.info(f"Cached data for chat_id={chat_id}")
+
+    # ── Send 3 buttons ───────────────────────────────────────
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="✅ Analysis complete! Kya dekhna hai?",
+        reply_markup=_build_keyboard(chat_id),
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Media-group batcher
+# ─────────────────────────────────────────────────────────────
+
+async def _process_group_after_delay(
+    media_group_id: str,
+    chat_id:        int,
+    context:        ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Wait 2 s for all group photos, then process together."""
+    await asyncio.sleep(2)
+
+    _scheduled_groups.discard(media_group_id)
+    file_ids = _pending_groups.pop(media_group_id, [])
+    if not file_ids:
+        return
+
+    n          = len(file_ids)
+    status_msg = None
+    try:
+        status_msg = await context.bot.send_message(
             chat_id=chat_id,
-            text="❌ Screenshot analyze nahi hua. Dobara try karo.",
+            text=f"⏳ {n} screenshot{'s' if n > 1 else ''} analyze ho raha hai... wait karo",
+        )
+        await _process_photos(file_ids, chat_id, context)
+    except Exception as e:
+        logger.error(f"Group {media_group_id} error: {e}")
+        await context.bot.send_message(chat_id=chat_id, text="❌ Error aaya. Dobara try karo.")
+    finally:
+        if status_msg:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
+            except TelegramError:
+                pass
+
+
+# ─────────────────────────────────────────────────────────────
+# Callback handler (button clicks)
+# ─────────────────────────────────────────────────────────────
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline button clicks: guns / vehicle / full."""
+    query = update.callback_query
+    await query.answer()   # removes the loading spinner on button
+
+    if not query.data or ":" not in query.data:
+        return
+
+    action, owner_id_str = query.data.split(":", 1)
+    chat_id = update.effective_chat.id
+
+    # Retrieve cached data
+    data = _user_cache.get(int(owner_id_str))
+    if not data:
+        await query.message.reply_text(
+            "⚠️ Data expire ho gaya. Dobara screenshot bhejo.",
         )
         return
 
-    # ── Send listing (split if > 4096 chars) ────────────────
-    await _send_long_message(chat_id, listing, context)
+    # Format the requested section
+    if action == "guns":
+        text = format_guns(data)
+    elif action == "vehicle":
+        text = format_vehicles(data)
+    else:   # "full"
+        text = format_full_inventory(data)
 
+    # Send as a new message (buttons stay visible for re-use)
+    await _send_long_message(chat_id, text, context)
+
+
+# ─────────────────────────────────────────────────────────────
+# Long message helper
+# ─────────────────────────────────────────────────────────────
 
 async def _send_long_message(
     chat_id: int,
-    text: str,
+    text:    str,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Send text, splitting on paragraph breaks if it exceeds Telegram's 4096 char limit."""
+    """Send text, splitting on paragraph breaks if > Telegram's 4096 char limit."""
     MAX = 4096
     if len(text) <= MAX:
         await context.bot.send_message(chat_id=chat_id, text=text)
@@ -270,60 +357,17 @@ async def _send_long_message(
 
 
 # ─────────────────────────────────────────────────────────────
-# Media-group batch processor
-# ─────────────────────────────────────────────────────────────
-
-async def _process_group_after_delay(
-    media_group_id: str,
-    chat_id: int,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    """
-    Wait 2 s for all photos in a media group to arrive, then
-    process them ALL together in a single API call.
-    """
-    await asyncio.sleep(2)
-
-    _scheduled_groups.discard(media_group_id)
-    file_ids = _pending_groups.pop(media_group_id, [])
-
-    if not file_ids:
-        return
-
-    n = len(file_ids)
-    status_msg = None
-    try:
-        status_msg = await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"⏳ {n} screenshot{'s' if n > 1 else ''} analyze ho raha hai... wait karo",
-        )
-        await _process_photos(file_ids, chat_id, context)
-    except Exception as e:
-        logger.error(f"Group {media_group_id} processing error: {e}")
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="❌ Kuch error aaya. Dobara try karo.",
-        )
-    finally:
-        if status_msg:
-            try:
-                await context.bot.delete_message(
-                    chat_id=chat_id,
-                    message_id=status_msg.message_id,
-                )
-            except TelegramError:
-                pass
-
-
-# ─────────────────────────────────────────────────────────────
 # Telegram handlers
 # ─────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "🎮 BGMI Describe Bot\n\n"
-        "BGMI account ke screenshots bhejo — main gun, outfit, vehicle, "
-        "helmet/bag aur stats sab detect karke structured listing bana dunga.\n\n"
+        "BGMI account ke screenshots bhejo — main analyze karke\n"
+        "3 buttons deta hoon:\n\n"
+        "🔫 GUNS — sirf gun skins\n"
+        "🚘 VEHICLE — sirf vehicle skins\n"
+        "📦 FULL INVENTORY — sab kuch\n\n"
         "Ek ya multiple screenshots ek saath bhej sakte ho.\n\n"
         "/help — commands dekhne ke liye"
     )
@@ -331,19 +375,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "📖 BGMI Describe Bot — Help\n\n"
-        "Kya karta hai:\n"
-        "🔫 Gun skins (naam + level)\n"
-        "🎽 Outfit / character skins\n"
-        "🚘 Vehicle skins\n"
-        "🎒 Helmet / bag skins\n"
-        "⛔️ Account stats\n"
-        "➖ Mythic Fashion count\n\n"
+        "📖 Help\n\n"
+        "Screenshot bhejo → Bot analyze karega → 3 buttons aayenge:\n"
+        "🔫 GUNS | 🚘 VEHICLE | 📦 FULL INVENTORY\n\n"
+        "Jo chahiye woh button dabao — woh section milega.\n\n"
         "Commands:\n"
         "/start  — welcome message\n"
         "/help   — yeh message\n"
         "/model  — current AI model\n\n"
-        "Screenshots bhejo — listing ready!"
+        "Detects:\n"
+        "🔫 Gun skins with level + Final Form\n"
+        "🎽 Outfit / character skins\n"
+        "🚘 Vehicle skins\n"
+        "🎒 Helmet / bag skins\n"
+        "⛔️ Account stats, room cards, popularity etc."
     )
 
 
@@ -361,27 +406,26 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """
     Handle incoming photo messages.
     Single photo  → process immediately.
-    Media group   → collect all photos, process together after 2 s.
+    Media group   → collect all, process together after 2 s.
     """
     chat_id        = update.effective_chat.id
     file_id        = update.message.photo[-1].file_id   # highest resolution
     media_group_id = update.message.media_group_id
 
     if media_group_id:
-        # ── Media group: batch all photos first ──────────────
+        # Batch mode: collect all photos first
         if media_group_id not in _pending_groups:
             _pending_groups[media_group_id] = []
         _pending_groups[media_group_id].append(file_id)
 
-        # Schedule exactly ONE processing task per group
+        # Schedule exactly ONE task per group
         if media_group_id not in _scheduled_groups:
             _scheduled_groups.add(media_group_id)
             asyncio.create_task(
                 _process_group_after_delay(media_group_id, chat_id, context)
             )
-
     else:
-        # ── Single photo ─────────────────────────────────────
+        # Single photo
         status_msg = None
         try:
             status_msg = await update.message.reply_text(
@@ -406,23 +450,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Global error handler.
-    - Conflict (409): Railway redeploy ke waqt 2 instances overlap karte hain — just log it.
-    - NetworkError: Temporary Telegram outage — just log it.
-    - Everything else: log with full details.
-    """
+    """Global error handler."""
     err = context.error
-
     if isinstance(err, Conflict):
-        # Happens briefly during Railway redeploys — safe to ignore
-        logger.warning("409 Conflict: old instance still shutting down. Will resolve in seconds.")
+        logger.warning("409 Conflict: Railway redeploy overlap. Will resolve in seconds.")
         return
-
     if isinstance(err, NetworkError):
         logger.warning(f"NetworkError (temporary): {err}")
         return
-
     logger.error(f"Unhandled error: {err}", exc_info=err)
 
 
@@ -443,13 +478,15 @@ def main() -> None:
     app.add_handler(CommandHandler("model", cmd_model))
 
     # Messages
-    app.add_handler(MessageHandler(filters.PHOTO,                    handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,  handle_text))
+    app.add_handler(MessageHandler(filters.PHOTO,                   handle_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Global error handler — handles 409 Conflict on Railway redeploys
+    # Inline button callbacks
+    app.add_handler(CallbackQueryHandler(handle_callback))
+
+    # Global error handler
     app.add_error_handler(handle_error)
 
-    # Start polling (Railway supports long-running workers)
     app.run_polling(drop_pending_updates=True)
 
 
